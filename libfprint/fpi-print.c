@@ -199,6 +199,8 @@ fpi_print_add_from_image (FpPrint *print,
   _minutiae.list = (struct fp_minutia **) minutiae->pdata;
   _minutiae.alloc = minutiae->len;
 
+  g_warning ("fpi_print_add_from_image: extracted %d minutiae", minutiae->len);
+
   xyt = g_new0 (struct xyt_struct, 1);
   minutiae_to_xyt (&_minutiae, image->width, image->height, xyt);
   g_ptr_array_add (print->prints, xyt);
@@ -259,6 +261,8 @@ fpi_print_bz3_match (FpPrint *print_template,
       gint score;
       gstruct = g_ptr_array_index (print_template->prints, i);
       score = bozorth_to_gallery (probe_len, pstruct, gstruct);
+      g_warning ("Bozorth3 match score: %d (threshold: %d, gallery print %d/%d)",
+                 score, bz3_threshold, i + 1, print_template->prints->len);
       fp_dbg ("score %d/%d", score, bz3_threshold);
 
       if (score >= bz3_threshold)

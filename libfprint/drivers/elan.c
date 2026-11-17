@@ -38,6 +38,7 @@
 
 #define FP_COMPONENT "elan"
 
+#include <stdio.h>
 #include "drivers_api.h"
 #include "elan.h"
 
@@ -217,10 +218,14 @@ elan_save_img_frame (FpiDeviceElan *elandev)
       sum += frame[i];
     }
 
+  g_warning ("ELAN save_img_frame: sum=%u (frame_size=%u, mean_diff=%u)",
+             sum, frame_size, sum / (frame_size ? frame_size : 1));
+
   if (sum == 0)
     {
       fp_dbg
         ("frame darker than background; finger present during calibration?");
+      g_warning ("ELAN save_img_frame: sum==0, frame darker than background");
       g_free (frame);
       return -1;
     }
@@ -292,6 +297,9 @@ elan_process_frame_thirds (unsigned short *raw_frame,
   lvl3 = sorted[frame_size - 1];
   g_free (sorted);
 
+  g_warning ("ELAN thirds: lvl0=%d, lvl1=%d, lvl2=%d, lvl3=%d (frame_size=%u)",
+             lvl0, lvl1, lvl2, lvl3, frame_size);
+
   /* Ensure levels are strictly monotonic to prevent division by zero */
   lvl1 = MAX (lvl1, lvl0 + 1);
   lvl2 = MAX (lvl2, lvl1 + 1);
@@ -323,6 +331,60 @@ elan_submit_image (FpImageDevice *dev)
   FpImage *img;
 
   G_DEBUG_HERE ();
+
+  /* For touch sensors, submit a single frame directly without
+   * multi-frame assembly. The sensor captures a complete fingerprint
+   * image in one press. */
+  if (self->dev_type & ELAN_IS_TOUCH_SENSOR)
+    {
+      struct fpi_frame *frame;
+
+      if (self->frames == NULL)
+        {
+          fp_dbg ("no frames captured for touch sensor");
+          fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_TOO_SHORT);
+          return;
+        }
+
+      /* Use the first (most recent) captured frame */
+      assembling_ctx.frame_width = self->frame_width;
+      assembling_ctx.frame_height = self->raw_frame_height;
+      assembling_ctx.image_width = self->frame_width;
+
+      self->process_frame ((unsigned short *) self->frames->data, &frames);
+
+      if (frames == NULL)
+        {
+          fp_dbg ("frame processing failed for touch sensor");
+          fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_GENERAL);
+          return;
+        }
+
+      frame = frames->data;
+
+      img = fp_image_new (self->frame_width, self->frame_height);
+      memcpy (img->data, frame->data, self->frame_width * self->frame_height);
+      img->width = self->frame_width;
+      img->height = self->frame_height;
+      img->flags = FPI_IMAGE_COLORS_INVERTED | FPI_IMAGE_H_FLIPPED | FPI_IMAGE_V_FLIPPED | FPI_IMAGE_PARTIAL;
+
+      {
+        FILE *f = fopen ("/tmp/elan_fp.pgm", "wb");
+        if (f)
+          {
+            fprintf (f, "P5\n%d %d\n255\n", self->frame_width, self->frame_height);
+            fwrite (frame->data, 1, self->frame_width * self->frame_height, f);
+            fclose (f);
+          }
+      }
+
+      g_warning ("ELAN submit image: %dx%d, flags=0x%x",
+                 self->frame_width, self->frame_height, img->flags);
+
+      g_slist_free_full (frames, g_free);
+      fpi_image_device_image_captured (dev, img);
+      return;
+    }
 
   raw_frames = g_slist_nth (self->frames, ELAN_SKIP_LAST_FRAMES);
 
@@ -485,6 +547,12 @@ stop_capture_run_state (FpiSsm *ssm, FpDevice *dev)
 }
 
 static void
+elan_finger_off_cb (FpDevice *dev, gpointer user_data)
+{
+  fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
+}
+
+static void
 stop_capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
 {
   FpImageDevice *dev = FP_IMAGE_DEVICE (_dev);
@@ -505,7 +573,12 @@ stop_capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
     }
 
   if (!error)
-    fpi_image_device_report_finger_status (dev, FALSE);
+    {
+      if (self->dev_type & ELAN_IS_TOUCH_SENSOR)
+        fpi_device_add_timeout (FP_DEVICE (dev), 400, elan_finger_off_cb, NULL, NULL);
+      else
+        fpi_image_device_report_finger_status (dev, FALSE);
+    }
   else
     /* NOTE: We cannot get a cancellation error here. */
     fpi_image_device_session_error (dev, error);
@@ -550,6 +623,7 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case CAPTURE_READ_DATA:
+      g_warning ("ELAN read_data: last_read=0x%02x", self->last_read ? self->last_read[0] : 0xff);
       /* 0x55 - finger present
        * 0xff - device not calibrated (probably) */
       if (self->last_read && self->last_read[0] == 0x55)
@@ -557,11 +631,11 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
           fpi_image_device_report_finger_status (idev, TRUE);
           elan_run_cmd (ssm, dev, &get_image_cmd, ELAN_CMD_TIMEOUT);
         }
-      else if (self->dev_type == ELAN_0C58 && self->last_read &&
+      else if ((self->dev_type & (ELAN_0C58 | ELAN_0C4F)) && self->last_read &&
                (self->last_read[0] == 0x00 || self->last_read[0] == 0xaf))
         {
           /* 0x00 - not ready
-           * 0xaf - finger removed or sensor busy (seen on 0x0c58) */
+           * 0xaf - finger removed or sensor busy */
           fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_WAIT_FINGER, 10);
         }
       else
@@ -579,6 +653,12 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       if (r < 0)
         {
           fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
+        }
+      else if (self->dev_type & ELAN_IS_TOUCH_SENSOR)
+        {
+          /* Touch sensors capture a complete image in a single press,
+           * so one frame is sufficient. */
+          fpi_ssm_next_state (ssm);
         }
       else if (self->num_frames < ELAN_MAX_FRAMES)
         {
@@ -607,7 +687,11 @@ capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
       (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT) &&
        fpi_ssm_get_cur_state (ssm) == CAPTURE_WAIT_FINGER))
     {
-      if (self->num_frames >= ELAN_MIN_FRAMES)
+      if ((self->dev_type & ELAN_IS_TOUCH_SENSOR) && self->num_frames >= 1)
+        {
+          elan_submit_image (dev);
+        }
+      else if (self->num_frames >= ELAN_MIN_FRAMES)
         {
           elan_submit_image (dev);
         }
@@ -694,6 +778,9 @@ enum calibrate_states {
 static gboolean
 elan_supports_calibration (FpiDeviceElan *elandev)
 {
+  if (elandev->dev_type & ELAN_IS_TOUCH_SENSOR)
+    return FALSE;
+
   if (elandev->dev_type == ELAN_0C42)
     return TRUE;
 
@@ -766,8 +853,8 @@ calibrate_run_state (FpiSsm *ssm, FpDevice *dev)
        * to 0x03. Because of this we don't just expect 0x03, we want to see 0x01
        * first. This is to make sure that a full calibration loop has completed */
       fp_dbg ("calibration status: 0x%02x", self->last_read[0]);
-      if (self->calib_status == 0x01 &&
-          self->last_read[0] == 0x03)
+      if ((self->calib_status == 0x01 && self->last_read[0] == 0x03) ||
+          (self->last_read[0] == 0x03 && self->calib_atts_left < ELAN_CALIBRATION_ATTEMPTS (self->dev_type) - 2))
         {
           self->calib_status = 0x03;
           fpi_ssm_jump_to_state (ssm, CALIBRATE_GET_BACKGROUND);
@@ -877,9 +964,18 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
           self->raw_frame_height = self->frame_height;
         }
       if (self->frame_height > ELAN_MAX_FRAME_HEIGHT)
-        self->frame_height = ELAN_MAX_FRAME_HEIGHT;
+        {
+          /* Touch sensors need the full frame height for a complete image;
+           * only crop for swipe sensors where tall frames hurt stitching. */
+          if (!(self->dev_type & ELAN_IS_TOUCH_SENSOR))
+            self->frame_height = ELAN_MAX_FRAME_HEIGHT;
+        }
       fp_dbg ("sensor dimensions, WxH: %dx%d", self->frame_width,
               self->raw_frame_height);
+      g_warning ("ELAN sensor dim raw: 0x%02x 0x%02x 0x%02x 0x%02x -> %dx%d",
+                 self->last_read[0], self->last_read[1],
+                 self->last_read[2], self->last_read[3],
+                 self->frame_width, self->frame_height);
       fpi_ssm_next_state (ssm);
       break;
 
@@ -944,6 +1040,14 @@ dev_init (FpImageDevice *dev)
       break;
     }
 
+  /* Touch sensors use thirds processing and lower Bozorth3 threshold */
+  if (self->dev_type & ELAN_IS_TOUCH_SENSOR)
+    {
+      fpi_device_set_scan_type (FP_DEVICE (dev), FP_SCAN_TYPE_PRESS);
+      fpi_image_device_set_bz3_threshold (dev, 12);
+      self->process_frame = elan_process_frame_thirds;
+    }
+
   fpi_image_device_open_complete (dev, NULL);
 }
 
@@ -981,7 +1085,12 @@ dev_change_state (FpImageDevice *dev, FpiImageDeviceState state)
    * devices to end up in a bad state.
    */
   if (state == FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON)
-    elan_calibrate (self);
+    {
+      if (self->background == NULL || !(self->dev_type & ELAN_IS_TOUCH_SENSOR))
+        elan_calibrate (self);
+      else
+        elan_capture (self);
+    }
 }
 
 static void
@@ -991,6 +1100,8 @@ dev_deactivate (FpImageDevice *dev)
 
   G_DEBUG_HERE ();
 
+  g_clear_pointer (&self->background, g_free);
+
   if (!self->active)
     /* The device is inactive already, complete the operation immediately. */
     fpi_image_device_deactivate_complete (dev, NULL);
@@ -999,6 +1110,17 @@ dev_deactivate (FpImageDevice *dev)
      * need to signal back deactivation).
      * Note that any running capture will be cancelled already if needed. */
     self->deactivating = TRUE;
+}
+
+static void
+dev_probe (FpDevice *dev)
+{
+  guint16 dev_type = fpi_device_get_driver_data (dev);
+
+  if (dev_type & ELAN_IS_TOUCH_SENSOR)
+    fpi_device_set_scan_type (dev, FP_SCAN_TYPE_PRESS);
+
+  fpi_device_probe_complete (dev, NULL, NULL, NULL);
 }
 
 static void
@@ -1016,6 +1138,7 @@ fpi_device_elan_class_init (FpiDeviceElanClass *klass)
   dev_class->type = FP_DEVICE_TYPE_USB;
   dev_class->id_table = elan_id_table;
   dev_class->scan_type = FP_SCAN_TYPE_SWIPE;
+  dev_class->probe = dev_probe;
 
   img_class->img_open = dev_init;
   img_class->img_close = dev_deinit;
